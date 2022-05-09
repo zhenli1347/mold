@@ -35,6 +35,7 @@
 namespace mold::elf {
 
 template <typename E> class RObjectFile;
+template <typename E> class RInputSection;
 
 template <typename E>
 class RChunk {
@@ -47,6 +48,7 @@ public:
   virtual void update_shdr(Context<E> &ctx) {}
   virtual void write_to(Context<E> &ctx) = 0;
 
+  std::vector<RInputSection<E> *> input_sections;
   std::string_view name;
   i64 shndx = 0;
   ElfShdr<E> in_shdr = {};
@@ -61,6 +63,8 @@ public:
   void write_to(Context<E> &ctx) override;
 
   RObjectFile<E> &file;
+  RChunk<E> *output_section;
+  RInputSection<E> *relocated_section;
 };
 
 template <typename E>
@@ -80,6 +84,7 @@ public:
 
   std::unordered_map<std::string_view, i64> sym_map;
   std::vector<ElfSym<E>> syms{1};
+  std::vector<RInputSection<E> *> sym_input_sections{1};
 };
 
 template <typename E>
@@ -147,6 +152,9 @@ template <typename E>
 void RSymtabSection<E>::add_local_symbol(Context<E> &ctx, RObjectFile<E> &file,
                                          i64 idx) {
   ElfSym<E> sym = file.syms[idx];
+  RInputSection<E> *sym_input_section =
+                    (sym.st_shndx == SHN_ABS || sym.st_shndx == SHN_COMMON)
+                    ? 0 : file.sections[sym.st_shndx].get();
   assert(sym.st_bind == STB_LOCAL);
 
   if (!sym.is_undef() && !sym.is_abs() && !sym.is_common()) {
@@ -160,12 +168,16 @@ void RSymtabSection<E>::add_local_symbol(Context<E> &ctx, RObjectFile<E> &file,
 
   file.symidx[idx] = syms.size();
   syms.push_back(sym);
+  sym_input_sections.push_back(sym_input_section);
 }
 
 template <typename E>
 void RSymtabSection<E>::add_global_symbol(Context<E> &ctx, RObjectFile<E> &file,
                                           i64 idx) {
   ElfSym<E> sym = file.syms[idx];
+  RInputSection<E> *sym_input_section =
+                    (sym.st_shndx == SHN_ABS || sym.st_shndx == SHN_COMMON)
+                    ? 0 : file.sections[sym.st_shndx].get();
   assert(sym.st_bind != STB_LOCAL);
 
   std::string_view name = file.strtab + sym.st_name;
@@ -177,6 +189,7 @@ void RSymtabSection<E>::add_global_symbol(Context<E> &ctx, RObjectFile<E> &file,
     sym.st_name = ctx.r_strtab->add_string(name);
     file.symidx[idx] = syms.size();
     syms.push_back(sym);
+    sym_input_sections.push_back(sym_input_section);
     return;
   }
 
@@ -188,6 +201,7 @@ void RSymtabSection<E>::add_global_symbol(Context<E> &ctx, RObjectFile<E> &file,
       sym.st_shndx = file.sections[sym.st_shndx]->shndx;
     sym.st_name = existing.st_name;
     existing = sym;
+    sym_input_sections[it->second] = sym_input_section;
   }
 }
 
@@ -255,16 +269,24 @@ void RInputSection<E>::write_to(Context<E> &ctx) {
   }
   case SHT_REL:
   case SHT_RELA: {
+    i64 offset_change = 0;
+    if (this->relocated_section && this->relocated_section->output_section)
+            offset_change = this->relocated_section->out_shdr.sh_offset -
+                 this->relocated_section->output_section->out_shdr.sh_offset;
+
+
     ElfRel<E> *rel = (ElfRel<E> *)(ctx.buf + this->out_shdr.sh_offset);
     i64 size = this->out_shdr.sh_size / sizeof(ElfRel<E>);
 
     for (i64 i = 0; i < size; i++) {
       const ElfSym<E> &sym = file.syms[rel[i].r_sym];
       if (sym.is_undef() || sym.is_abs() || sym.is_common() ||
-          file.sections[sym.st_shndx])
+          file.sections[sym.st_shndx]) {
         rel[i].r_sym = file.symidx[rel[i].r_sym];
-      else
+        rel[i].r_offset += offset_change;
+      } else {
         memset(rel + i, 0, sizeof(ElfRel<E>));
+      }
     }
 
     i64 i = 0;
@@ -369,6 +391,14 @@ RObjectFile<E>::RObjectFile(Context<E> &ctx, MappedFile<Context<E>> &mf,
     }
   }
 
+  for (i64 i = 1; i < sections.size(); i++) {
+    if (sections[i] &&
+         (sections[i]->in_shdr.sh_type == SHT_REL ||
+          sections[i]->in_shdr.sh_type == SHT_RELA))
+      sections[i]->relocated_section =
+        sections[sections[i]->in_shdr.sh_info].get();
+  }
+
   // Read global symbols
   for (i64 i = first_global; i < syms.size(); i++) {
     std::string_view name = strtab + syms[i].st_name;
@@ -469,8 +499,30 @@ static i64 assign_offsets(Context<E> &ctx) {
     offset = align_to(offset, chunk->out_shdr.sh_addralign);
     chunk->out_shdr.sh_offset = offset;
     offset += chunk->out_shdr.sh_size;
+    for (RChunk<E> *input_section : chunk->input_sections) {
+      offset = align_to(offset, input_section->out_shdr.sh_addralign);
+      input_section->out_shdr.sh_offset = offset;
+      chunk->out_shdr.sh_size += input_section->out_shdr.sh_size;
+      offset += input_section->out_shdr.sh_size;
+    }
   }
   return offset;
+}
+
+template <typename E>
+static void update_symbol_offsets(Context<E> &ctx) {
+  for (int i = 1; i < ctx.r_symtab->syms.size(); i++) {
+    RInputSection<E> *input_section = ctx.r_symtab->sym_input_sections[i];
+    if (!input_section)
+      continue;
+
+    RChunk<E> *output_section = input_section->output_section;
+    if (!output_section)
+      continue;
+
+    ctx.r_symtab->syms[i].st_value +=
+    input_section->out_shdr.sh_offset - output_section->out_shdr.sh_offset;
+  }
 }
 
 static bool contains(std::unordered_set<std::string_view> &a,
@@ -539,9 +591,25 @@ void combine_objects(Context<E> &ctx, std::span<std::string> file_args) {
 
   // Add input sections to output sections
   for (std::unique_ptr<RObjectFile<E>> &file : files)
-    for (std::unique_ptr<RInputSection<E>> &sec : file->sections)
-      if (sec)
+    for (std::unique_ptr<RInputSection<E>> &sec : file->sections) {
+      bool new_section = true;
+      if (!sec || sec->in_shdr.sh_type == SHT_GROUP)
+        continue;
+
+      for (RChunk<E> *chunk : ctx.r_chunks) {
+        if (chunk->name == sec->name) {
+          sec->output_section = chunk;
+          chunk->input_sections.push_back(sec.get());
+          new_section = false;
+          break;
+        }
+      }
+
+      if (new_section) {
+        sec->output_section = 0;
         ctx.r_chunks.push_back(sec.get());
+      }
+    }
 
   ctx.r_chunks.push_back(&symtab);
   ctx.r_chunks.push_back(&shdr);
@@ -549,8 +617,11 @@ void combine_objects(Context<E> &ctx, std::span<std::string> file_args) {
   // Assign output section indices
   i64 shndx = 1;
   for (RChunk<E> *chunk : ctx.r_chunks)
-    if (chunk != &ehdr && chunk != &shdr)
+    if (chunk != &ehdr && chunk != &shdr) {
       chunk->shndx = shndx++;
+      for (RChunk<E> *input_section : chunk->input_sections)
+        input_section->shndx = chunk->shndx;
+    }
 
   // Add section names to .shstrtab
   for (RChunk<E> *chunk : ctx.r_chunks)
@@ -574,14 +645,18 @@ void combine_objects(Context<E> &ctx, std::span<std::string> file_args) {
 
   // Open an output file
   i64 filesize = assign_offsets(ctx);
+  update_symbol_offsets(ctx);
   std::unique_ptr<OutputFile<E>> out =
     OutputFile<E>::open(ctx, ctx.arg.output, filesize, 0666);
   memset(out->buf, 0, filesize);
   ctx.buf = out->buf;
 
   // Write to the output file
-  for (RChunk<E> *chunk : ctx.r_chunks)
+  for (RChunk<E> *chunk : ctx.r_chunks) {
     chunk->write_to(ctx);
+    for (RChunk<E> *input_section : chunk->input_sections)
+      input_section->write_to(ctx);
+  }
   out->close(ctx);
 }
 
