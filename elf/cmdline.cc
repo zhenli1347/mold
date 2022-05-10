@@ -96,6 +96,7 @@ Options:
   --oformat=binary            Omit ELF, section and program headers
   --pack-dyn-relocs=[relr,none]
                               Pack dynamic relocations
+  --package-info=STRING       Set a given string to .note.package
   --perf                      Print performance statistics
   --pie, --pic-executable     Create a position independent executable
     --no-pie, --no-pic-executable
@@ -611,6 +612,8 @@ std::vector<std::string> parse_nonpositional_args(Context<E> &ctx) {
       ctx.arg.pack_dyn_relocs_relr = true;
     } else if (read_flag("pack-dyn-relocs=none")) {
       ctx.arg.pack_dyn_relocs_relr = false;
+    } else if (read_arg("package-info")) {
+      ctx.arg.package_info = arg;
     } else if (read_flag("stats")) {
       ctx.arg.stats = true;
       Counter::enabled = true;

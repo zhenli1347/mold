@@ -875,6 +875,20 @@ public:
 };
 
 template <typename E>
+class NotePackageSection : public Chunk<E> {
+public:
+  NotePackageSection() {
+    this->name = ".note.package";
+    this->shdr.sh_type = SHT_NOTE;
+    this->shdr.sh_flags = SHF_ALLOC;
+    this->shdr.sh_addralign = 4;
+  }
+
+  void update_shdr(Context<E> &ctx) override;
+  void copy_buf(Context<E> &ctx) override;
+};
+
+template <typename E>
 class NotePropertySection : public Chunk<E> {
 public:
   NotePropertySection() {
@@ -1636,6 +1650,7 @@ struct Context {
     std::string fini = "_fini";
     std::string init = "_init";
     std::string output = "a.out";
+    std::string package_info;
     std::string plugin;
     std::string rpaths;
     std::string soname;
@@ -1744,6 +1759,7 @@ struct Context {
   std::unique_ptr<VerneedSection<E>> verneed;
   std::unique_ptr<VerdefSection<E>> verdef;
   std::unique_ptr<BuildIdSection<E>> buildid;
+  std::unique_ptr<NotePackageSection<E>> note_package;
   std::unique_ptr<NotePropertySection<E>> note_property;
   std::unique_ptr<GdbIndexSection<E>> gdb_index;
   std::unique_ptr<ThumbToArmSection> thumb_to_arm;
